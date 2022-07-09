@@ -1,9 +1,284 @@
-#include <Arduino.h>
 
-void setup() {
-  // put your setup code here, to run once:
+#include "Arduino.h"
+#include <GGOW3_inferencing.h>
+#include <PDM.h> //Include PDM library included with the Aruino_Apollo3 core
+//#include "SD.h"
+#include "SdFat.h"
+#include <SPI.h>
+#include "RTC.h" // Include RTC library included with the Aruino_Apollo3 core
+#include "BurstMode.h"
+
+#define SPI_SPEED SD_SCK_MHZ(50)
+SdFat SD;
+AP3_PDM myPDM;   //Create instance of PDM class with our buffer
+
+#define pdmDataSize 16000 //Library requires array be 4096
+uint16_t pdmData[pdmDataSize];
+/** Audio buffers, pointers and selectors */
+typedef struct {
+    int16_t *buffer;
+    uint32_t buf_count;
+    uint32_t n_samples;
+} inference_t;
+
+int MODE_BUTTON_PIN = 10;
+enum Mode { adhoc, passive};
+//default mode
+Mode mode = passive;
+
+int sd_failure = false;
+
+void *PDMHandle = NULL;
+am_hal_pdm_config_t newConfig = {
+    .eClkDivider = AM_HAL_PDM_MCLKDIV_1,
+    .eLeftGain = AM_HAL_PDM_GAIN_0DB,
+    .eRightGain = AM_HAL_PDM_GAIN_0DB, //Found empirically
+    .ui32DecimationRate = 48,            // OSR = 1500/16 = 96 = 2*SINCRATE --> SINC_RATE = 48
+    .bHighPassEnable = 0,
+    .ui32HighPassCutoff = 0xB,
+    .ePDMClkSpeed = AM_HAL_PDM_CLK_1_5MHZ,
+    .bInvertI2SBCLK = 0,
+    .ePDMClkSource = AM_HAL_PDM_INTERNAL_CLK,
+    .bPDMSampleDelay = 0,
+    .bDataPacking = 1,
+    .ePCMChannels = AM_HAL_PDM_CHANNEL_RIGHT,
+    .ui32GainChangeDelay = 1,
+    .bI2SEnable = 0,
+    .bSoftMute = 0,
+    .bLRSwap = 0,
+};
+
+File myFile;
+
+void dateTime(uint16_t* date, uint16_t* time) {
+  *date = FAT_DATE(rtc.year, rtc.month, rtc.dayOfMonth);
+
+  // return time using FAT_TIME macro to format fields
+  *time = FAT_TIME(rtc.hour, rtc.minute, rtc.seconds);
 }
 
-void loop() {
-  // put your main code here, to run repeatedly:
+//needs some optimization but works
+String getFileName(String base)
+{
+    if(!SD.exists("/audio"))
+        SD.mkdir("/audio");
+  //int count = 1;
+  //String name = "/audio/"+ base + String(count,DEC) + ".raw";
+  //while(SD.exists(name)){
+    //name = "/audio/"+ base + String(count++,DEC) + ".raw";
+  //}
+    rtc.getTime();
+    String ts = String(rtc.month) + "-" + String(rtc.dayOfMonth) + "-" + String(rtc.year) + " " + String(rtc.hour) + "-" + String(rtc.minute) + "-" + String(rtc.seconds);
+    String name = "/audio/"+ base + ts + ".raw";
+  return name;
+}
+
+static inference_t inference;
+static bool debug_nn = false; // Set this to true to see e.g. features generated from the raw signal
+
+void recordInference()
+{
+    Serial.print("Initializing SD card...");
+    if (!SD.begin(2)) {
+        Serial.println("initialization failed!");
+        sd_failure = true;
+        return;
+    }
+    sd_failure = false;
+    Serial.println("initialization done.");
+    String filename = getFileName("inf");
+    myFile = SD.open(filename,  FILE_WRITE);
+    myFile.sync();
+    myFile.write((uint8_t *)pdmData, sizeof(pdmData));
+    myFile.close();
+    
+}
+
+void blinkIndicator()
+{
+    for(int i = 0; i < 5; i++)
+    {
+        digitalWrite(LED_BUILTIN,LOW);
+        delay(200);
+        digitalWrite(LED_BUILTIN,HIGH);
+        delay(200);
+    }
+}
+/**
+ * @brief      Init inferencing struct and setup/start PDM
+ *
+ * @param[in]  n_samples  The n samples
+ *
+ * @return     { description_of_the_return_value }
+ */
+bool microphone_inference_start(uint32_t n_samples)
+{
+    inference.buffer = (int16_t *)malloc(n_samples * sizeof(int16_t));
+    inference.n_samples  = n_samples;
+
+    if (myPDM.begin() == false) // Turn on PDM with default settings, start interrupts
+    {
+        Serial.println("PDM Init failed. Are you sure these pins are PDM capable?");
+        return false;
+    }
+    bool output = myPDM.updateConfig(newConfig); //Send config struct
+    return true;
+}
+
+
+/**
+ * Get raw audio signal data
+ */
+static int microphone_audio_signal_get_data(size_t offset, size_t length, float *out_ptr)
+{
+    numpy::int16_to_float(&inference.buffer[offset], out_ptr, length);
+
+    return 0;
+}
+
+/**
+ * @brief      Arduino setup function
+ */
+void setup()
+{
+    Serial.begin(115200);
+    rtc.getTime();
+    SdFile::dateTimeCallback(dateTime);
+    //validate SD is working
+    Serial.print("Initializing SD card...");
+    if (!SD.begin(2))
+    { 
+        Serial.println("initialization failed!");
+        sd_failure = true;
+    }
+    else
+        SD.end();
+    
+    //enableBurstMode(); //Go to 96MHz
+    //LED indicator for file writing/GGO detection
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, HIGH);
+    //mode button
+    pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
+
+
+    // summary of inferencing settings (from model_metadata.h)
+    ei_printf("Inferencing settings:\n");
+    ei_printf("\tInterval: %.2f ms.\n", (float)EI_CLASSIFIER_INTERVAL_MS);
+    ei_printf("\tFrame size: %d\n", EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE);
+    ei_printf("\tSample length: %d ms.\n", EI_CLASSIFIER_RAW_SAMPLE_COUNT / 16);
+    ei_printf("\tNo. of classes: %d\n", sizeof(ei_classifier_inferencing_categories) / sizeof(ei_classifier_inferencing_categories[0]));
+
+    if (microphone_inference_start(EI_CLASSIFIER_RAW_SAMPLE_COUNT) == false) {
+        ei_printf("ERR: Failed to setup audio sampling\r\n");
+        return;
+    }
+}
+
+void printTimestamps(FsFile& f) {
+  Serial.print("Creation: ");
+  f.printCreateDateTime(&Serial);
+  Serial.print("Modify: ");
+  f.printModifyDateTime(&Serial);
+  Serial.print("Access: ");
+  f.printAccessDateTime(&Serial);
+}
+
+/**
+ * @brief      Arduino main function. Runs the inferencing loop.
+ */
+void loop()
+{
+    if(sd_failure)
+        blinkIndicator();
+    //check mode
+    if(digitalRead(MODE_BUTTON_PIN) == LOW)
+    {
+        mode = adhoc;
+        blinkIndicator();
+    }
+
+    if(mode == adhoc){
+         Serial.print("Initializing SD card...");
+        if (!SD.begin(2))
+        { 
+            Serial.println("initialization failed!");
+            sd_failure = true;
+        }
+        else
+        {
+            sd_failure = false;
+            String filename = getFileName("adhoc");
+            myFile = SD.open(filename,  FILE_WRITE);
+            if (!myFile.timestamp(T_CREATE, 2014, 11, 10, 1, 2, 3)) 
+                error("set create time failed");
+            
+              // set write/modification date time
+            if (!myFile.timestamp(T_WRITE, 2014, 11, 11, 4, 5, 6)) 
+                error("set write time failed");
+
+            // set access date
+            if (!myFile.timestamp(T_ACCESS, 2014, 11, 12, 7, 8, 9))
+                error("set access time failed");
+            myFile.sync();
+            printTimestamps(myFile);
+            Serial.print("writing to file:");
+            Serial.println(filename);
+            while(digitalRead(MODE_BUTTON_PIN) != LOW)
+            {
+                if(myPDM.available())
+                {
+                    myPDM.getData(pdmData, pdmDataSize);
+                    myFile.write((uint8_t *)pdmData, sizeof(pdmData));
+                }
+            }
+            blinkIndicator();
+            digitalWrite(LED_BUILTIN,LOW);
+            myFile.close();
+            Serial.println("done recording to file");
+        }
+        mode = passive;
+    }
+    else if(mode == passive)
+    {
+        inference.buf_count = 0;
+        while(inference.buf_count < inference.n_samples)
+        {
+            if(myPDM.available())
+            {
+                int available = myPDM.getData(pdmData, pdmDataSize);
+                for(int i = 0; i < available; i++) {
+                    inference.buffer[inference.buf_count++] = pdmData[i];
+                }
+            }
+        }
+
+        signal_t signal;
+        signal.total_length = EI_CLASSIFIER_RAW_SAMPLE_COUNT;
+        signal.get_data = &microphone_audio_signal_get_data;
+        ei_impulse_result_t result = { 0 };
+
+        EI_IMPULSE_ERROR r = run_classifier(&signal, &result, debug_nn);
+        if (r != EI_IMPULSE_OK) {
+            ei_printf("ERR: Failed to run classifier (%d)\n", r);
+            return;
+        }
+        digitalWrite(LED_BUILTIN, LOW);
+        // print the predictions
+        ei_printf("Predictions ");
+        ei_printf("(DSP: %d ms., Classification: %d ms., Anomaly: %d ms.)",
+            result.timing.dsp, result.timing.classification, result.timing.anomaly);
+        ei_printf(": \n");
+        for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
+            //ei_printf("    %s: %f\n", result.classification[ix].label, result.classification[ix].value);
+            if(strcmp("GGOW Territorial", result.classification[ix].label) == 0 && result.classification[ix].value > 0.5)
+            {
+                digitalWrite(LED_BUILTIN, HIGH);
+                Serial.println("Recording inference sample to file...");
+                recordInference();
+            }
+            Serial.print(result.classification[ix].label);
+            Serial.println((result.classification[ix].value));
+        }
+    }
 }
