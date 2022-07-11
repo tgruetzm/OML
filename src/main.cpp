@@ -1,6 +1,6 @@
 
 #include "Arduino.h"
-#include <GGOW3_inferencing.h>
+#include <GGOW4_inferencing.h>
 #include <PDM.h> //Include PDM library included with the Aruino_Apollo3 core
 //#include "SD.h"
 #include "SdFat.h"
@@ -12,7 +12,7 @@
 SdFat SD;
 AP3_PDM myPDM;   //Create instance of PDM class with our buffer
 
-#define pdmDataSize 16000 //Library requires array be 4096
+#define pdmDataSize 8000 //must change based on sample frequency //Library requires array be 4096
 uint16_t pdmData[pdmDataSize];
 /** Audio buffers, pointers and selectors */
 typedef struct {
@@ -31,12 +31,12 @@ int sd_failure = false;
 void *PDMHandle = NULL;
 am_hal_pdm_config_t newConfig = {
     .eClkDivider = AM_HAL_PDM_MCLKDIV_1,
-    .eLeftGain = AM_HAL_PDM_GAIN_0DB,
-    .eRightGain = AM_HAL_PDM_GAIN_0DB, //Found empirically
+    .eLeftGain = AM_HAL_PDM_GAIN_P405DB,
+    .eRightGain = AM_HAL_PDM_GAIN_P405DB, //Found empirically
     .ui32DecimationRate = 48,            // OSR = 1500/16 = 96 = 2*SINCRATE --> SINC_RATE = 48
     .bHighPassEnable = 0,
     .ui32HighPassCutoff = 0xB,
-    .ePDMClkSpeed = AM_HAL_PDM_CLK_1_5MHZ,
+    .ePDMClkSpeed = AM_HAL_PDM_CLK_750KHZ,//16khzAM_HAL_PDM_CLK_1_5MHZ,
     .bInvertI2SBCLK = 0,
     .ePDMClkSource = AM_HAL_PDM_INTERNAL_CLK,
     .bPDMSampleDelay = 0,
@@ -51,10 +51,9 @@ am_hal_pdm_config_t newConfig = {
 File myFile;
 
 void dateTime(uint16_t* date, uint16_t* time) {
-  *date = FAT_DATE(rtc.year, rtc.month, rtc.dayOfMonth);
-
-  // return time using FAT_TIME macro to format fields
-  *time = FAT_TIME(rtc.hour, rtc.minute, rtc.seconds);
+    rtc.getTime();
+    *date = FAT_DATE(rtc.year + 2000, rtc.month, rtc.dayOfMonth);
+    *time = FAT_TIME(rtc.hour, rtc.minute, rtc.seconds);
 }
 
 //needs some optimization but works
@@ -62,14 +61,8 @@ String getFileName(String base)
 {
     if(!SD.exists("/audio"))
         SD.mkdir("/audio");
-  //int count = 1;
-  //String name = "/audio/"+ base + String(count,DEC) + ".raw";
-  //while(SD.exists(name)){
-    //name = "/audio/"+ base + String(count++,DEC) + ".raw";
-  //}
     rtc.getTime();
-    String ts = String(rtc.month) + "-" + String(rtc.dayOfMonth) + "-" + String(rtc.year) + " " + String(rtc.hour) + "-" + String(rtc.minute) + "-" + String(rtc.seconds);
-    String name = "/audio/"+ base + ts + ".raw";
+    String name = "/audio/"+ base + String(rtc.getEpoch()) + ".raw";
   return name;
 }
 
@@ -88,7 +81,7 @@ void recordInference()
     Serial.println("initialization done.");
     String filename = getFileName("inf");
     myFile = SD.open(filename,  FILE_WRITE);
-    myFile.sync();
+    myFile.timestamp(T_CREATE, rtc.year + 2000, rtc.month, rtc.dayOfMonth, rtc.hour, rtc.minute, rtc.seconds);
     myFile.write((uint8_t *)pdmData, sizeof(pdmData));
     myFile.close();
     
@@ -143,6 +136,16 @@ void setup()
 {
     Serial.begin(115200);
     rtc.getTime();
+    //rtc.setTime(0, 0, 34, 8, 9, 7, 22); // (hund, ss, mm, hh, dd, mm, yy)
+    Serial.printf("It is now ");
+    Serial.printf("%d:", rtc.hour);
+    Serial.printf("%02d:", rtc.minute);
+    Serial.printf("%02d.", rtc.seconds);
+    Serial.printf("%02d", rtc.hundredths);
+
+    Serial.printf(" %02d/", rtc.month);
+    Serial.printf("%02d/", rtc.dayOfMonth);
+    Serial.printf("%02d", rtc.year);
     SdFile::dateTimeCallback(dateTime);
     //validate SD is working
     Serial.print("Initializing SD card...");
@@ -175,15 +178,6 @@ void setup()
     }
 }
 
-void printTimestamps(FsFile& f) {
-  Serial.print("Creation: ");
-  f.printCreateDateTime(&Serial);
-  Serial.print("Modify: ");
-  f.printModifyDateTime(&Serial);
-  Serial.print("Access: ");
-  f.printAccessDateTime(&Serial);
-}
-
 /**
  * @brief      Arduino main function. Runs the inferencing loop.
  */
@@ -210,20 +204,11 @@ void loop()
             sd_failure = false;
             String filename = getFileName("adhoc");
             myFile = SD.open(filename,  FILE_WRITE);
-            if (!myFile.timestamp(T_CREATE, 2014, 11, 10, 1, 2, 3)) 
-                error("set create time failed");
-            
-              // set write/modification date time
-            if (!myFile.timestamp(T_WRITE, 2014, 11, 11, 4, 5, 6)) 
-                error("set write time failed");
-
-            // set access date
-            if (!myFile.timestamp(T_ACCESS, 2014, 11, 12, 7, 8, 9))
-                error("set access time failed");
-            myFile.sync();
-            printTimestamps(myFile);
+            myFile.timestamp(T_CREATE, rtc.year + 2000, rtc.month, rtc.dayOfMonth, rtc.hour, rtc.minute, rtc.seconds);
             Serial.print("writing to file:");
             Serial.println(filename);
+            Serial.print("gain: ");
+            Serial.println(myPDM.getRightGain());
             while(digitalRead(MODE_BUTTON_PIN) != LOW)
             {
                 if(myPDM.available())
