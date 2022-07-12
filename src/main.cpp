@@ -34,8 +34,8 @@ am_hal_pdm_config_t newConfig = {
     .eLeftGain = AM_HAL_PDM_GAIN_P405DB,
     .eRightGain = AM_HAL_PDM_GAIN_P405DB, //Found empirically
     .ui32DecimationRate = 48,            // OSR = 1500/16 = 96 = 2*SINCRATE --> SINC_RATE = 48
-    .bHighPassEnable = 0,
-    .ui32HighPassCutoff = 0xB,
+    .bHighPassEnable = 0,//this is actuall enabled
+    .ui32HighPassCutoff = 0x9,//0x9 seems to filter out low band noise well, need to test if we are attenuating the signal too far
     .ePDMClkSpeed = AM_HAL_PDM_CLK_750KHZ,//16khzAM_HAL_PDM_CLK_1_5MHZ,
     .bInvertI2SBCLK = 0,
     .ePDMClkSource = AM_HAL_PDM_INTERNAL_CLK,
@@ -48,21 +48,20 @@ am_hal_pdm_config_t newConfig = {
     .bLRSwap = 0,
 };
 
-File myFile;
-
-void dateTime(uint16_t* date, uint16_t* time) {
+/*void dateTime(uint16_t* date, uint16_t* time) {
     rtc.getTime();
     *date = FAT_DATE(rtc.year + 2000, rtc.month, rtc.dayOfMonth);
     *time = FAT_TIME(rtc.hour, rtc.minute, rtc.seconds);
-}
+}*/
 
 //needs some optimization but works
-String getFileName(String base)
+String getFileName(String base, uint32_t &epoch)
 {
     if(!SD.exists("/audio"))
         SD.mkdir("/audio");
     rtc.getTime();
-    String name = "/audio/"+ base + String(rtc.getEpoch()) + ".raw";
+    epoch = rtc.getEpoch();
+    String name = "/audio/"+ base + String(epoch) + ".raw";
   return name;
 }
 
@@ -79,9 +78,10 @@ void recordInference()
     }
     sd_failure = false;
     Serial.println("initialization done.");
-    String filename = getFileName("inf");
-    myFile = SD.open(filename,  FILE_WRITE);
-    myFile.timestamp(T_CREATE, rtc.year + 2000, rtc.month, rtc.dayOfMonth, rtc.hour, rtc.minute, rtc.seconds);
+    uint32_t epoch;
+    String filename = getFileName("inf", epoch);
+    File myFile = SD.open(filename,  FILE_WRITE);
+    myFile.timestamp(T_CREATE | T_WRITE, rtc.year + 2000, rtc.month, rtc.dayOfMonth, rtc.hour, rtc.minute, rtc.seconds);
     myFile.write((uint8_t *)pdmData, sizeof(pdmData));
     myFile.close();
     
@@ -96,6 +96,13 @@ void blinkIndicator()
         digitalWrite(LED_BUILTIN,HIGH);
         delay(200);
     }
+}
+
+void writeLog(String message)
+{
+    File file = SD.open("log.txt", FILE_WRITE);
+    file.println(message);
+    file.close();
 }
 /**
  * @brief      Init inferencing struct and setup/start PDM
@@ -137,16 +144,10 @@ void setup()
     Serial.begin(115200);
     rtc.getTime();
     //rtc.setTime(0, 0, 34, 8, 9, 7, 22); // (hund, ss, mm, hh, dd, mm, yy)
-    Serial.printf("It is now ");
-    Serial.printf("%d:", rtc.hour);
-    Serial.printf("%02d:", rtc.minute);
-    Serial.printf("%02d.", rtc.seconds);
-    Serial.printf("%02d", rtc.hundredths);
-
-    Serial.printf(" %02d/", rtc.month);
-    Serial.printf("%02d/", rtc.dayOfMonth);
-    Serial.printf("%02d", rtc.year);
-    SdFile::dateTimeCallback(dateTime);
+    char buffer[40];
+    sprintf(buffer,"Now: %02d:%02d:%02d %02d/%02d/%02d",rtc.hour,rtc.minute,rtc.seconds, rtc.month,rtc.dayOfMonth,rtc.year);
+    Serial.println(buffer);
+    //SdFile::dateTimeCallback(dateTime);
     //validate SD is working
     Serial.print("Initializing SD card...");
     if (!SD.begin(2))
@@ -202,13 +203,12 @@ void loop()
         else
         {
             sd_failure = false;
-            String filename = getFileName("adhoc");
-            myFile = SD.open(filename,  FILE_WRITE);
-            myFile.timestamp(T_CREATE, rtc.year + 2000, rtc.month, rtc.dayOfMonth, rtc.hour, rtc.minute, rtc.seconds);
+            uint32_t epoch;
+            String filename = getFileName("adhoc",epoch);
+            File myFile = SD.open(filename,  FILE_WRITE);
+            myFile.timestamp(T_CREATE | T_WRITE, rtc.year + 2000, rtc.month, rtc.dayOfMonth, rtc.hour, rtc.minute, rtc.seconds);
             Serial.print("writing to file:");
             Serial.println(filename);
-            Serial.print("gain: ");
-            Serial.println(myPDM.getRightGain());
             while(digitalRead(MODE_BUTTON_PIN) != LOW)
             {
                 if(myPDM.available())
@@ -261,6 +261,15 @@ void loop()
                 digitalWrite(LED_BUILTIN, HIGH);
                 Serial.println("Recording inference sample to file...");
                 recordInference();
+                char buffer[40];
+                sprintf(buffer,"Now: %02d:%02d:%02d %02d/%02d/%02d",rtc.hour,rtc.minute,rtc.seconds, rtc.month,rtc.dayOfMonth,rtc.year);
+                writeLog(buffer);
+                sprintf(buffer,"Epoch: %d",rtc.getEpoch());
+                writeLog(buffer);
+                char x[8];
+                float val = result.classification[ix].value;
+                sprintf(buffer, "    %s: %d.%02d", result.classification[ix].label,  (int)val, (int)(fabsf(val)*100)%100);
+                writeLog(buffer);
             }
             Serial.print(result.classification[ix].label);
             Serial.println((result.classification[ix].value));
